@@ -11,15 +11,17 @@ import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -67,6 +69,7 @@ public class AddressExtractor {
     properties.put("username", config.getString("username"));
     properties.put("password", config.getString("password"));
     properties.put("protocol", config.getString("protocol"));
+    properties.setProperty("mail.imap.ssl.enable", "true");
 
     return properties;
   }
@@ -82,8 +85,9 @@ public class AddressExtractor {
     try {
       //Connect to the server
       Session session = Session.getDefaultInstance(props, null);
-      Store store = session.getStore(protocol);
-      store.connect(host, username, password);
+      Store store = session.getStore("imaps");
+      store.connect(host, 993, username, password);
+      Stream.of(store.getPersonalNamespaces()).forEach(System.out::println);
 
       return store;
     } catch (MessagingException e) {
@@ -97,6 +101,7 @@ public class AddressExtractor {
       Store store = loadEmailStore();
       //open the inbox folder
       Folder inbox = store.getFolder(config.getString("imapFolder", "INBOX"));
+
       inbox.open(Folder.READ_ONLY);
       List<Message> messages = Arrays.asList(
           inbox.search(betweenDatesTerm(
@@ -105,24 +110,36 @@ public class AddressExtractor {
               )
           ));
 
-      messages = messages.stream()
-          .filter(this::hasRelevantSubject)
-          .peek(message -> LOGGER.info("[run] found relevant message. " + this.msgToJsonObject(message)))
-          .collect(Collectors.toList());
+      AtomicInteger i = new AtomicInteger(0);
+      messages.stream()
+          .filter(this::isInvoiceEmail)
+          .peek(message -> LOGGER.info("[run] found relevant message. " + i.getAndIncrement() + " "))//  + this.msgToJsonObject(message)))
+          .forEach(message -> {
 
-      LOGGER.info("[run] found relevant messages. Total=" + messages.size());
+            String address = null;
+            try {
+              LOGGER.info("[run] Begin processing of:" + message.getSubject());
 
+              address = getFrom(message);
 
-      for (Message message : messages) {
+              Path folder = checkTargetOrCreate(message.getReceivedDate()).resolve(address);
+              if (!Files.exists(folder)) {
+                Files.createDirectory(folder);
+              }
 
-        String address = getFrom(message);
-        Path folder = checkTargetOrCreate().resolve(address);
-        if (!Files.exists(folder)) {
-          Files.createDirectory(folder);
-        }
-        saveAttachmemnt(message, folder);
-        saveMessage(message, folder);
-      }
+              LOGGER.info("[run] Saving attachments: " + message.getSubject());
+              JsonArray fileNames = saveAttachmemnt(message, folder);
+
+              LOGGER.info("[run] Saving message: " + message.getSubject());
+              saveMessage(message, folder, fileNames);
+
+              LOGGER.info("[run] Message processed: " + message.getSubject());
+
+            } catch (Exception e) {
+              LOGGER.log(Level.WARNING, "[run] Error" + e.getMessage(), e);
+
+            }
+          });
 //
 //          .peek(this::saveAttachmemnt)
 //          .map(this::msgToJsonObject)
@@ -136,15 +153,18 @@ public class AddressExtractor {
     } catch (MessagingException me) {
       System.err.println("messaging exception");
       me.printStackTrace();
-    } catch (IOException e) {
-      throw new RuntimeException(e);
     }
   }
 
-  private void saveMessage(Message message, Path folder) {
 
-    JsonObject msg = msgToJsonObject(message);
-    String name = msg.getString("subject").replace(" ", "_").toLowerCase();
+  private String createMessageName(Message message) throws MessagingException {
+    return message.getSubject().replaceAll("[/\\ ]", "_").replace(" ", "_").toLowerCase();
+  }
+
+  private void saveMessage(Message message, Path folder, JsonArray fileNames) {
+
+    JsonObject msg = msgToJsonObject(message, fileNames);
+    String name = msg.getString("subject").replaceAll("[/\\ ]", "_").replace(" ", "_").toLowerCase();
     folder = folder.resolve(name + ".json");
     byte[] bytes = msg.toString().getBytes();
     try {
@@ -164,48 +184,72 @@ public class AddressExtractor {
 
   }
 
-  public void saveAttachmemnt(Message message, Path folder) {
-//    List<File> attachments = new ArrayList<File>();
+  public JsonArray saveAttachmemnt(Message message, Path folder) {
     Multipart multipart = null;
+    JsonArrayBuilder builder = Json.createArrayBuilder();
     try {
+
+      if (!message.getContentType().toLowerCase().contains("multipart")) {
+        return builder.build();
+      }
+
       multipart = (Multipart) message.getContent();
+
       for (int i = 0; i < multipart.getCount(); i++) {
+
         BodyPart bodyPart = multipart.getBodyPart(i);
+
         if (!Part.ATTACHMENT.equalsIgnoreCase(bodyPart.getDisposition()) &&
             (bodyPart.getFileName() == null || bodyPart.getFileName().isEmpty())) {
           continue; // dealing with attachments only
         }
-        InputStream is = bodyPart.getInputStream();
-        Path target = folder.resolve(bodyPart.getFileName());
-        Files.copy(is, target);
-//        File f = new File("tmp_" + bodyPart.getFileName());
-//        FileOutputStream fos = new FileOutputStream(f);
-//        byte[] buf = new byte[4096];
-//        int bytesRead;
-//        while ((bytesRead = is.read(buf)) != -1) {
-//          fos.write(buf, 0, bytesRead);
-//        }
-//        fos.close();
-//        attachments.add(f);
+
+        try (InputStream is = bodyPart.getInputStream()) {
+
+          String fName = createMessageName(message) + "--" + bodyPart.getFileName().replace(".", "--" + System.currentTimeMillis() + ".");
+          builder.add(fName);
+          Path target = folder.resolve(fName);
+          Files.copy(is, target);
+
+        }
       }
     } catch (IOException | MessagingException e) {
-      throw new RuntimeException(e);
+      LOGGER.info("[saveAttachmemnt] More likely Not a multipart message: " + e.getClass().getSimpleName() + ":" + e.getMessage());
     }
+
+    return builder.build();
   }
 
   public JsonArray getContent(Message message) {
-//    List<File> attachments = new ArrayList<File>();
-    Multipart multipart = null;
+    Multipart multipart;
     JsonArrayBuilder text = Json.createArrayBuilder();
     try {
-      multipart = (Multipart) message.getContent();
-      for (int i = 0; i < multipart.getCount(); i++) {
-        BodyPart bodyPart = multipart.getBodyPart(i);
-        if (!Part.ATTACHMENT.equalsIgnoreCase(bodyPart.getDisposition())) {
-          String txt = new BufferedReader(new InputStreamReader(bodyPart.getInputStream())).lines().collect(Collectors.joining("\n"));
-          text.add(txt.replaceAll("(?s)<[^>]*>(\\s*<[^>]*>)*", " "));
+
+      String type = message.getContentType().toLowerCase();
+      boolean isPlain = Stream.of("html", "text").anyMatch(type::contains);
+
+      String body = "";
+
+      if (isPlain) {
+        body = (String) message.getContent();
+      } else {
+
+        multipart = (Multipart) message.getContent();
+        for (int i = 0; i < multipart.getCount(); i++) {
+          BodyPart bodyPart = multipart.getBodyPart(i);
+          if (!Part.ATTACHMENT.equalsIgnoreCase(bodyPart.getDisposition())) {
+            try (BufferedReader buff = new BufferedReader(new InputStreamReader(bodyPart.getInputStream()))) {
+              buff.lines().collect(Collectors.joining("\n"));
+            }
+          }
         }
       }
+
+      if (!body.isEmpty()) {
+        text.add(body.replaceAll("(?s)<[^>]*>(\\s*<[^>]*>)*", " "));
+        text.add(body);
+      }
+
     } catch (IOException | MessagingException e) {
       throw new RuntimeException(e);
     }
@@ -213,11 +257,11 @@ public class AddressExtractor {
     return text.build();
   }
 
-  private Path checkTargetOrCreate() {
+  private Path checkTargetOrCreate(Date date) {
 
     String path = config.getString("output");
     Path target = Paths.get(path);
-    target = target.resolve(Paths.get(getPeriod()));
+    target = target.resolve(Paths.get(getPeriodName(date)));
 
     if (!Files.exists(target)) {
       try {
@@ -230,11 +274,15 @@ public class AddressExtractor {
     return target;
   }
 
-  String getPeriod() {
-    return LocalDate.now().format(DateTimeFormatter.ofPattern("MMMM_yyyy")).toUpperCase();
+  String getPeriodName(Date date) {
+    return LocalDateTime.ofInstant(date.toInstant(), ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("MMMM_yyyy")).toUpperCase();
   }
 
-  private JsonObject msgToJsonObject(Message message) {
+  private JsonObject msgToJsonObject(Message message, JsonArray fileNames) {
+
+    if (fileNames == null) {
+      fileNames = JsonArray.EMPTY_JSON_ARRAY;
+    }
 
     try {
       return Json.createObjectBuilder()
@@ -244,6 +292,7 @@ public class AddressExtractor {
           .add("messageNumber", message.getMessageNumber())
           .add("body", getContent(message))
           .add("received", message.getSentDate().toString())
+          .add("files", fileNames)
           .build();
 
     } catch (MessagingException e) {
@@ -265,6 +314,7 @@ public class AddressExtractor {
         throw new RuntimeException(e);
       }
     });
+//    return true;
   }
 
   private boolean isInvoiceEmail(Message message) {

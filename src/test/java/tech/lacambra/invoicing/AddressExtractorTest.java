@@ -5,6 +5,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.time.LocalDate;
+import java.util.Date;
 
 public class AddressExtractorTest {
 
@@ -19,7 +20,7 @@ public class AddressExtractorTest {
   @Test
   public void getPeriod() {
 
-    Assert.assertEquals(LocalDate.now().getMonth() + "_" + LocalDate.now().getYear(), cut.getPeriod());
+    Assert.assertEquals(LocalDate.now().getMonth() + "_" + LocalDate.now().getYear(), cut.getPeriodName(new Date()));
 
   }
 }
