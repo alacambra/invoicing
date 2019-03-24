@@ -309,17 +309,21 @@ public class AddressExtractor {
       String type = partType.toLowerCase();
       LOGGER.info(String.format("[getAndSaveContent] Message %s is of type %s", msgName, type));
       String body = "";
+      String encoding = getEncoding(type);
+
+      LOGGER.info("[getAndSaveContent] Using encoding " + encoding);
+
 
       if (isTextHtml(type)) {
 
         body = getContentString(content);
-        generatePDFFromHTML(msgName, body, folder);
-        saveEmailAsTextFile(msgName, body, folder, "html");
+        generatePDFFromHTML(msgName, body, folder, encoding);
+        saveEmailAsTextFile(msgName, body, folder, "html", encoding);
 
       } else if (isTextPlain(type)) {
 
         body = getContentString(content);
-        saveEmailAsTextFile(msgName, body, folder, "txt");
+        saveEmailAsTextFile(msgName, body, folder, "txt", encoding);
 
       } else if (isApplicationPdf(type) || (content instanceof BodyPart && partIsAttachment((BodyPart) content))) {
         savePart((BodyPart) content, msgName, folder);
@@ -355,6 +359,17 @@ public class AddressExtractor {
     } else {
       return (String) content;
     }
+  }
+
+
+  private String getEncoding(String type) {
+
+    String[] enc = type.split("charset=");
+    if (enc.length == 2) {
+      return enc[1];
+    }
+    return "utf-8";
+
   }
 
   private Multipart getContentMultipart(Object content) throws IOException, MessagingException {
@@ -436,7 +451,7 @@ public class AddressExtractor {
     return from;
   }
 
-  private void generatePDFFromHTML(String fileName, String body, Path folder) {
+  private void generatePDFFromHTML(String fileName, String body, Path folder, String encoding) {
 
     if (body == null) {
       body = "";
@@ -445,7 +460,7 @@ public class AddressExtractor {
 
     Path filePath = folder.resolve(fileName + "-" + System.currentTimeMillis() + ".email.pdf");
 
-    try (InputStream bodyStream = new ByteArrayInputStream(body.getBytes("windows-1252"))) {
+    try (InputStream bodyStream = new ByteArrayInputStream(body.getBytes(encoding))) {
 
       Tidy tidy = new Tidy();
       tidy.setQuiet(false);
@@ -493,14 +508,14 @@ public class AddressExtractor {
     }
   }
 
-  private void saveEmailAsTextFile(String fileName, String body, Path folder, String extension) {
+  private void saveEmailAsTextFile(String fileName, String body, Path folder, String extension, String encoding) {
 
     if (body == null) {
       body = "";
     }
 
     try {
-      Files.write(folder.resolve(fileName + "-" + System.currentTimeMillis() + ".email." + extension), body.getBytes());
+      Files.write(folder.resolve(fileName + "-" + System.currentTimeMillis() + ".email." + extension), body.getBytes(encoding));
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
