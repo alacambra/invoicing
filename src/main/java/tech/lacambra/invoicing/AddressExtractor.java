@@ -1,10 +1,8 @@
 package tech.lacambra.invoicing;
 
-import com.itextpdf.text.Document;
-import com.itextpdf.text.DocumentException;
-import com.itextpdf.text.pdf.PdfWriter;
-import com.itextpdf.tool.xml.XMLWorkerHelper;
 import com.itextpdf.tool.xml.exceptions.RuntimeWorkerException;
+import org.w3c.tidy.Tidy;
+import org.xhtmlrenderer.pdf.ITextRenderer;
 
 import javax.json.*;
 import javax.json.stream.JsonCollectors;
@@ -22,10 +20,7 @@ import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.util.Arrays;
-import java.util.Date;
-import java.util.List;
-import java.util.Properties;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -38,13 +33,69 @@ public class AddressExtractor {
   private static final Logger LOGGER = Logger.getLogger(AddressExtractor.class.getName());
   private static final String TEXT_PLAIN = "text/plain";
   private static final String TEXT_HTML = "text/html";
+  private static final String MULTIPART_ALTERNATIVE = "multipart/alternative";
+  private static final String MULTIPART_MIXED = "multipart/mixed";
+  private static final String APPLICATION_PDF = "application/pdf";
   private JsonObject config;
 
-  public static void main(String[] args) throws IOException {
+  public static void main(String[] args) {
 
     AddressExtractor extractor = new AddressExtractor();
     extractor.run();
-//    extractor.checkTargetOrCreate();
+
+  }
+
+  void run() {
+    try {
+      Store store = loadEmailStore();
+      //open the inbox folder
+      Folder inbox = store.getFolder(config.getString("imapFolder", "INBOX"));
+
+      inbox.open(Folder.READ_ONLY);
+      List<Message> messages = Arrays.asList(
+          inbox.search(betweenDatesTerm(
+              LocalDateTime.now().minusDays(config.getInt("deltaStart", 1)).with(LocalTime.MIN),
+              LocalDateTime.now().minusDays(config.getInt("deltaEnd", 1)).with(LocalTime.MAX)
+              )
+          ));
+
+      AtomicInteger i = new AtomicInteger(0);
+      messages.stream()
+          .filter(this::isInvoiceEmail)
+          .peek(message -> LOGGER.info("[run] found relevant message. " + i.getAndIncrement() + " "))//  + this.msgToJsonObject(message)))
+          .forEach(message -> {
+
+            try {
+              LOGGER.info("[run] Begin processing for mail:" + message.getSubject());
+
+              Path folder = checkTargetFolderOrCreate(message.getReceivedDate());
+              if (!Files.exists(folder)) {
+                Files.createDirectory(folder);
+              }
+
+              LOGGER.info("[run] Saving attachments for mail: " + message.getSubject());
+              JsonArray attachmentNames = saveAttachment(message, folder);
+
+              LOGGER.info("[run] Saving message for mail: " + message.getSubject());
+              saveMessage(message, folder, attachmentNames, folder);
+
+              LOGGER.info("[run] Message processed: " + message.getSubject());
+
+            } catch (Exception e) {
+              LOGGER.log(Level.WARNING, "[run] Error" + e.getMessage(), e);
+
+            }
+          });
+
+      inbox.close(false);
+      store.close();
+
+    } catch (NoSuchProviderException nspe) {
+      System.err.println("invalid provider name");
+    } catch (MessagingException me) {
+      System.err.println("messaging exception");
+      me.printStackTrace();
+    }
   }
 
   private JsonObject loadConfig() {
@@ -77,6 +128,7 @@ public class AddressExtractor {
     properties.put("username", config.getString("username"));
     properties.put("password", config.getString("password"));
     properties.put("protocol", config.getString("protocol"));
+    properties.setProperty("port", config.getString("port"));
     properties.setProperty("mail.imap.ssl.enable", "true");
 
     return properties;
@@ -89,77 +141,17 @@ public class AddressExtractor {
     String username = props.getProperty("username");
     String password = props.getProperty("password");
     String protocol = props.getProperty("protocol");
-    int port = Integer.parseInt(props.getProperty("protocol"));
+    String port = props.getProperty("port");
 
     try {
-      //Connect to the server
       Session session = Session.getDefaultInstance(props, null);
       Store store = session.getStore(protocol);
-      store.connect(host, 993, username, password);
+      store.connect(host, Integer.parseInt(port), username, password);
       Stream.of(store.getPersonalNamespaces()).forEach(System.out::println);
 
       return store;
     } catch (MessagingException e) {
       throw new RuntimeException(e);
-    }
-
-  }
-
-  void run() {
-    try {
-      Store store = loadEmailStore();
-      //open the inbox folder
-      Folder inbox = store.getFolder(config.getString("imapFolder", "INBOX"));
-
-      inbox.open(Folder.READ_ONLY);
-      List<Message> messages = Arrays.asList(
-          inbox.search(betweenDatesTerm(
-              LocalDateTime.now().minusDays(config.getInt("deltaStart", 1)).with(LocalTime.MIN),
-              LocalDateTime.now().minusDays(config.getInt("deltaEnd", 1)).with(LocalTime.MAX)
-              )
-          ));
-
-      AtomicInteger i = new AtomicInteger(0);
-      messages.stream()
-          .filter(this::isInvoiceEmail)
-          .peek(message -> LOGGER.info("[run] found relevant message. " + i.getAndIncrement() + " "))//  + this.msgToJsonObject(message)))
-          .forEach(message -> {
-
-            String address = null;
-            try {
-              LOGGER.info("[run] Begin processing of:" + message.getSubject());
-
-              Path folder = checkTargetOrCreate(message.getReceivedDate());
-              if (!Files.exists(folder)) {
-                Files.createDirectory(folder);
-              }
-
-              LOGGER.info("[run] Saving attachments: " + message.getSubject());
-              JsonArray fileNames = saveAttachmemnt(message, folder);
-
-              LOGGER.info("[run] Saving message: " + message.getSubject());
-              saveMessage(message, folder, fileNames, folder);
-
-              LOGGER.info("[run] Message processed: " + message.getSubject());
-
-            } catch (Exception e) {
-              LOGGER.log(Level.WARNING, "[run] Error" + e.getMessage(), e);
-
-            }
-          });
-//
-//          .peek(this::saveAttachmemnt)
-//          .map(this::msgToJsonObject)
-//          .forEach(System.out::println);
-
-      inbox.close(false);
-      store.close();
-
-    } catch (NoSuchProviderException nspe) {
-      System.err.println("invalid provider name");
-    } catch (MessagingException me) {
-      System.err.println("messaging exception");
-      me.printStackTrace();
     }
   }
 
@@ -168,123 +160,212 @@ public class AddressExtractor {
     return message.getSubject().replaceAll("[/\\ ]", "_").replace(" ", "_").toLowerCase();
   }
 
-  private void saveMessage(Message message, Path folder, JsonArray fileNames, Path path) {
+  private void saveMessage(Message message, Path folder, JsonArray attachmentNames, Path path) {
 
-    JsonObject msg = msgToJsonObject(message, fileNames, path);
-    String name = msg.getString("subject").replaceAll("[/\\ ]", "_").replace(" ", "_").toLowerCase();
-    folder = folder.resolve(name + ".json");
-    byte[] bytes = msg.toString().getBytes();
     try {
-      Files.write(folder, bytes);
-    } catch (IOException e) {
-      throw new RuntimeException(e);
-    }
 
+      String from = Stream.of(message.getFrom()).map(this::addressToStr).map(Object::toString).collect(Collectors.joining(", "));
+      String subject = message.getSubject();
+      String receivedOn = message.getReceivedDate().toString();
+      String to = Stream.of(message.getFrom()).map(this::addressToStr).map(Object::toString).collect(Collectors.joining(", "));
+
+      int messageNumber = message.getMessageNumber();
+      JsonArray content = getContent(message, path);
+
+      JsonObject jsonMsg = msgToJsonObject(from, to, subject, messageNumber, content, receivedOn, attachmentNames);
+      String name = jsonMsg.getString("subject").replaceAll("[/\\ ]", "_").replace(" ", "_").toLowerCase();
+      folder = folder.resolve(name + ".json");
+
+      byte[] bytes = jsonMsg.toString().getBytes();
+      Files.write(folder, bytes);
+
+    } catch (MessagingException | IOException e) {
+      e.printStackTrace();
+    }
   }
 
   private SearchTerm betweenDatesTerm(LocalDateTime start, LocalDateTime end) {
 
     SearchTerm newerThan = new ReceivedDateTerm(ComparisonTerm.GE, Date.from(start.toInstant(ZoneOffset.of("+1"))));
     SearchTerm olderThan = new ReceivedDateTerm(ComparisonTerm.LE, Date.from(end.toInstant(ZoneOffset.of("+1"))));
+
     return new AndTerm(olderThan, newerThan);
-
-
   }
 
-  public JsonArray saveAttachmemnt(Message message, Path folder) {
-    Multipart multipart = null;
-    JsonArrayBuilder builder = Json.createArrayBuilder();
+  public JsonArray saveAttachment(Message message, Path folder) {
+
     try {
 
-      if (!message.getContentType().toLowerCase().contains("multipart")) {
-        return builder.build();
+      if (!isMultipart(message)) {
+        return JsonValue.EMPTY_JSON_ARRAY;
       }
 
-      multipart = (Multipart) message.getContent();
+      Multipart multipart = (Multipart) message.getContent();
 
+      return saveAttachmentFromAllParts(multipart, folder, createMessageName(message));
+
+    } catch (MessagingException | IOException e) {
+      LOGGER.info("[saveAttachment] More likely not a multipart message: " + e.getClass().getSimpleName() + ":" + e.getMessage());
+    }
+
+    return JsonValue.EMPTY_JSON_ARRAY;
+  }
+
+  private JsonArray saveAttachmentFromAllParts(Multipart multipart, Path folder, String messageName) {
+    JsonArrayBuilder builder = Json.createArrayBuilder();
+
+    try {
       for (int i = 0; i < multipart.getCount(); i++) {
 
         BodyPart bodyPart = multipart.getBodyPart(i);
 
-        if (!Part.ATTACHMENT.equalsIgnoreCase(bodyPart.getDisposition()) &&
-            (bodyPart.getFileName() == null || bodyPart.getFileName().isEmpty())) {
-          continue; // dealing with attachments only
+        if (!partIsAttachment(bodyPart)) {
+          continue;
         }
 
-        try (InputStream is = bodyPart.getInputStream()) {
-
-          String fName = createMessageName(message) + "--" + bodyPart.getFileName().replace(".", "--" + System.currentTimeMillis() + ".");
-          builder.add(fName);
-          Path target = folder.resolve(fName);
-          Files.copy(is, target);
-
-        }
+        savePart(bodyPart, messageName, folder).ifPresent(builder::add);
       }
-    } catch (IOException | MessagingException e) {
-      LOGGER.info("[saveAttachmemnt] More likely Not a multipart message: " + e.getClass().getSimpleName() + ":" + e.getMessage());
+    } catch (MessagingException e) {
+      LOGGER.info("[saveAttachmentFromAllParts] Error reading message: " + e.getClass().getSimpleName() + ":" + e.getMessage());
+
     }
 
     return builder.build();
   }
 
-  public JsonArray getContent(Message message, Path folder) {
-    Multipart multipart;
-    JsonArrayBuilder text = Json.createArrayBuilder();
+  private Optional<String> savePart(BodyPart bodyPart, String messageName, Path folder) {
+
+    try (InputStream is = bodyPart.getInputStream()) {
+
+      String fName = messageName + "--" + bodyPart.getFileName().replace(".", "--" + System.currentTimeMillis() + ".");
+      Path target = folder.resolve(fName);
+      Files.copy(is, target);
+
+      return Optional.of(fName);
+
+    } catch (IOException | MessagingException e) {
+      LOGGER.info("[savePart] Error reading message: " + e.getClass().getSimpleName() + ":" + e.getMessage());
+    }
+
+    return Optional.empty();
+  }
+
+  private boolean partIsAttachment(BodyPart bodyPart) {
     try {
+      return Part.ATTACHMENT.equalsIgnoreCase(bodyPart.getDisposition()) &&
+          (bodyPart.getFileName() == null || bodyPart.getFileName().isEmpty());
+    } catch (MessagingException e) {
+      LOGGER.info("[partIsAttachment] Error reading message part: " + e.getClass().getSimpleName() + ":" + e.getMessage());
+      return false;
+    }
+  }
 
+  private boolean isMultipart(Message message) throws MessagingException {
+    return message.getContentType().toLowerCase().contains("multipart");
+  }
+
+  public JsonArray getContent(Message message, Path folder) {
+
+    try {
+      String msgName = createMessageName(message);
       String type = message.getContentType().toLowerCase();
-      boolean isHtml = Stream.of("html").anyMatch(type::contains);
-      boolean isPlain = Stream.of("text").anyMatch(type::contains);
 
-      String body = "";
-
-      if (isHtml) {
-
-        body = (String) message.getContent();
-        generatePDFFromHTML(createMessageName(message), body, folder);
-
-      } else if (isPlain) {
-
-        body = (String) message.getContent();
-        saveEmailAsTextFile(createMessageName(message), body, folder, "txt");
-
-      } else {
-
-        multipart = (Multipart) message.getContent();
-        for (int i = 0; i < multipart.getCount(); i++) {
-          BodyPart bodyPart = multipart.getBodyPart(i);
-          if (!Part.ATTACHMENT.equalsIgnoreCase(bodyPart.getDisposition())) {
-            try (BufferedReader buff = new BufferedReader(new InputStreamReader(bodyPart.getInputStream()))) {
-              String bodyPartText = buff.lines().collect(Collectors.joining("\n"));
-              if (bodyPart.getContentType().contains(TEXT_HTML)) {
-                try {
-                  generatePDFFromHTML(createMessageName(message), bodyPartText, folder);
-                } catch (RuntimeWorkerException e) {
-                  saveEmailAsTextFile(createMessageName(message), bodyPartText, folder, "html");
-                }
-              } else if (bodyPart.getContentType().contains(TEXT_PLAIN)) {
-                saveEmailAsTextFile(createMessageName(message), bodyPartText, folder, "txt");
-              }
-            }
-          }
-        }
-
-        saveEmailAsTextFile(createMessageName(message), body, folder, "txt");
-      }
-
-      if (!body.isEmpty()) {
-        text.add(body.replaceAll("(?s)<[^>]*>(\\s*<[^>]*>)*", " "));
-        text.add(body);
-      }
+      return getAndSaveContent(type, message.getContent(), msgName, folder, Json.createArrayBuilder()).build();
 
     } catch (IOException | MessagingException e) {
       throw new RuntimeException(e);
     }
 
-    return text.build();
   }
 
-  private Path checkTargetOrCreate(Date date) {
+  private boolean isTextHtml(String type) {
+    return type.contains(TEXT_HTML);
+  }
+
+  private boolean isTextPlain(String type) {
+    return type.contains(TEXT_PLAIN);
+  }
+
+  private boolean isMultipartAlternative(String type) {
+    return type.contains(MULTIPART_ALTERNATIVE);
+  }
+
+  private boolean isMultipartMixed(String type) {
+    return type.contains(MULTIPART_MIXED);
+  }
+
+  private boolean isMultipart(String type) {
+    return isMultipartAlternative(type) || isMultipartMixed(type);
+  }
+
+  private boolean isApplicationPdf(String type) {
+    return type.contains(APPLICATION_PDF);
+  }
+
+  public JsonArrayBuilder getAndSaveContent(String partType, Object content, String msgName, Path folder, JsonArrayBuilder builder) {
+
+    try {
+
+      String type = partType.toLowerCase();
+      LOGGER.info(String.format("[getAndSaveContent] Message %s is of type %s", msgName, type));
+      String body = "";
+
+      if (isTextHtml(type)) {
+
+        body = getContentString(content);
+        generatePDFFromHTML(msgName, body, folder);
+        saveEmailAsTextFile(msgName, body, folder, "html");
+
+      } else if (isTextPlain(type)) {
+
+        body = getContentString(content);
+        saveEmailAsTextFile(msgName, body, folder, "txt");
+
+      } else if (isApplicationPdf(type) || (content instanceof BodyPart && partIsAttachment((BodyPart) content))) {
+        savePart((BodyPart) content, msgName, folder);
+
+      } else if (isMultipart(type)) {
+
+        Multipart multipart = getContentMultipart(content);
+
+        for (int i = 0; i < multipart.getCount(); i++) {
+          BodyPart bodyPart = multipart.getBodyPart(i);
+          builder = getAndSaveContent(bodyPart.getContentType(), bodyPart, msgName, folder, builder);
+        }
+
+      } else {
+        LOGGER.warning("[getAndSaveContent] Unexpected content type ");
+      }
+
+      if (!body.isEmpty()) {
+        builder.add(body.replaceAll("(?s)<[^>]*>(\\s*<[^>]*>)*", " "));
+        builder.add(body);
+      }
+
+    } catch (MessagingException | IOException e) {
+      throw new RuntimeException(e);
+    }
+
+    return builder;
+  }
+
+  private String getContentString(Object content) throws IOException, MessagingException {
+    if (content instanceof BodyPart) {
+      return (String) ((BodyPart) content).getContent();
+    } else {
+      return (String) content;
+    }
+  }
+
+  private Multipart getContentMultipart(Object content) throws IOException, MessagingException {
+    if (content instanceof BodyPart) {
+      return (Multipart) ((BodyPart) content).getContent();
+    } else {
+      return (Multipart) content;
+    }
+  }
+
+  private Path checkTargetFolderOrCreate(Date date) {
 
     String path = config.getString("output");
     Path target = Paths.get(path);
@@ -305,70 +386,37 @@ public class AddressExtractor {
     return LocalDateTime.ofInstant(date.toInstant(), ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("MMMM_yyyy")).toUpperCase();
   }
 
-  private JsonObject msgToJsonObject(Message message, JsonArray fileNames, Path path) {
+  private JsonObject msgToJsonObject(String from, String to, String subject, int messageNumber, JsonArray content, String receivedOn, JsonArray fileNames) {
 
     if (fileNames == null) {
       fileNames = JsonArray.EMPTY_JSON_ARRAY;
     }
 
-    try {
-      return Json.createObjectBuilder()
-          .add("from", recipientsToString(message))
-          .add("to", Stream.of(message.getFrom()).map(this::addressToStr).map(Object::toString).collect(Collectors.joining(", ")))
-          .add("subject", message.getSubject())
-          .add("messageNumber", message.getMessageNumber())
-          .add("body", getContent(message, path))
-          .add("received", message.getSentDate().toString())
-          .add("files", fileNames)
-          .build();
-
-    } catch (MessagingException e) {
-      throw new RuntimeException(e);
-    }
-  }
-
-  private boolean hasRelevantSubject(Message message) {
-
-    JsonArray relevantSubjects = loadConfig().getJsonArray("relevantSubjects");
-    LOGGER.fine("[hasRelevantSubject] Relevant subjects: " + relevantSubjects);
-
-    return relevantSubjects.stream().anyMatch(subject -> {
-      try {
-        return message.getSubject().toLowerCase().contains(((JsonString) subject).getString().toLowerCase())
-            ||
-            ((JsonString) subject).getString().toLowerCase().contains(message.getSubject().toLowerCase());
-      } catch (MessagingException e) {
-        throw new RuntimeException(e);
-      }
-    });
-//    return true;
+    return Json.createObjectBuilder()
+        .add("from", from)
+        .add("to", to)
+        .add("subject", subject)
+        .add("messageNumber", messageNumber)
+        .add("body", content)
+        .add("received", receivedOn)
+        .add("files", fileNames)
+        .build();
   }
 
   private boolean isInvoiceEmail(Message message) {
 
     String filterEmail = loadConfig().getString("filterEmail");
     try {
-      LOGGER.info("[isInvoiceEmail] Filtering email " + filterEmail + ", from " + getFrom(message));
-      return List.of(message.getAllRecipients()).toString().contains(filterEmail);
+      if (List.of(message.getAllRecipients()).toString().contains(filterEmail)) {
+        LOGGER.info("[isInvoiceEmail] found invoicing email " + filterEmail + ", from " + getFrom(message));
+        return true;
+      }
     } catch (MessagingException e) {
-      throw new RuntimeException(e);
-    }
-  }
-
-  private JsonArray recipientsToString(Message message) {
-
-
-    try {
-      return Stream.of(message.getAllRecipients())
-          .map(this::addressToStr)
-//          .filter(jsonObject -> jsonObject.getString("txt").contains("invoice@lacambra.tech"))
-          .collect(JsonCollectors.toJsonArray());
-
-    } catch (MessagingException e) {
-      throw new RuntimeException(e);
+      LOGGER.log(Level.WARNING, "[isInvoiceEmail] Error: " + e.getCause(), e);
+      return false;
     }
 
-
+    return false;
   }
 
 
@@ -386,6 +434,90 @@ public class AddressExtractor {
     }
 
     return from;
+  }
+
+  private void generatePDFFromHTML(String fileName, String body, Path folder) {
+
+    if (body == null) {
+      body = "";
+    }
+
+
+    Path filePath = folder.resolve(fileName + "-" + System.currentTimeMillis() + ".email.pdf");
+
+    try (InputStream bodyStream = new ByteArrayInputStream(body.getBytes("windows-1252"))) {
+
+      Tidy tidy = new Tidy();
+      tidy.setQuiet(false);
+      tidy.setBreakBeforeBR(true);
+      tidy.setXHTML(true);
+      tidy.setShowWarnings(false);
+      tidy.setMakeClean(true);
+      String tmpFileName = filePath.toString() + ".xhtml";
+      FileOutputStream fileOutputStream = new FileOutputStream(tmpFileName);
+      tidy.parseDOM(bodyStream, fileOutputStream);
+      fileOutputStream.close();
+
+      if (Files.size(Paths.get(tmpFileName)) == 0) {
+        Files.delete(Paths.get(tmpFileName));
+        return;
+      }
+
+      File f = Paths.get(tmpFileName).toFile();
+      ITextRenderer renderer = new ITextRenderer();
+      renderer.setDocument(f);
+      renderer.layout();
+
+      try (OutputStream os = new FileOutputStream(filePath.toString())) {
+        renderer.createPDF(os);
+      }
+
+      Files.delete(Paths.get(tmpFileName));
+
+    } catch (RuntimeWorkerException | IOException | com.lowagie.text.DocumentException e) {
+
+      if (Files.exists(filePath)) {
+        try {
+          Files.delete(filePath);
+        } catch (IOException e1) {
+          throw new RuntimeException(e);
+        }
+      }
+
+      if (e instanceof RuntimeWorkerException) {
+        LOGGER.log(Level.WARNING, "Error generating pedf for mail " + fileName + ": " + e.getMessage(), e);
+        return;
+      }
+
+      throw new RuntimeException(e);
+    }
+  }
+
+  private void saveEmailAsTextFile(String fileName, String body, Path folder, String extension) {
+
+    if (body == null) {
+      body = "";
+    }
+
+    try {
+      Files.write(folder.resolve(fileName + "-" + System.currentTimeMillis() + ".email." + extension), body.getBytes());
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private JsonArray recipientsToString(Message message) {
+
+
+    try {
+      return Stream.of(message.getAllRecipients())
+          .map(this::addressToStr)
+//          .filter(jsonObject -> jsonObject.getString("txt").contains("invoice@lacambra.tech"))
+          .collect(JsonCollectors.toJsonArray());
+
+    } catch (MessagingException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   private String removeQuotes(String stringToModify) {
@@ -406,53 +538,19 @@ public class AddressExtractor {
     return new String(newStringBuffer);
   }
 
-  private void generatePDFFromHTML(String fileName, String body, Path folder) {
+  private boolean hasRelevantSubject(Message message) {
 
-    if (body == null) {
-      body = "";
-    }
+    JsonArray relevantSubjects = loadConfig().getJsonArray("relevantSubjects");
+    LOGGER.fine("[hasRelevantSubject] Relevant subjects: " + relevantSubjects);
 
-
-    Path filePath = folder.resolve(fileName + "-" + System.currentTimeMillis() + ".email.pdf");
-
-    try (InputStream bodyStream = new ByteArrayInputStream(body.getBytes())) {
-
-      Document document = new Document();
-      PdfWriter writer = PdfWriter.getInstance(document, new FileOutputStream(filePath.toString()));
-      document.open();
-      XMLWorkerHelper.getInstance().parseXHtml(writer, document, bodyStream);
-      document.close();
-
-    } catch (DocumentException | RuntimeWorkerException | IOException e) {
-
-      if (Files.exists(filePath)) {
-        try {
-          Files.delete(filePath);
-        } catch (IOException e1) {
-          throw new RuntimeException(e);
-        }
+    return relevantSubjects.stream().anyMatch(subject -> {
+      try {
+        return message.getSubject().toLowerCase().contains(((JsonString) subject).getString().toLowerCase())
+            ||
+            ((JsonString) subject).getString().toLowerCase().contains(message.getSubject().toLowerCase());
+      } catch (MessagingException e) {
+        throw new RuntimeException(e);
       }
-
-      if (e instanceof RuntimeWorkerException) {
-        throw (RuntimeWorkerException) e;
-      }
-
-      throw new RuntimeException(e);
-    }
+    });
   }
-
-  private void saveEmailAsTextFile(String fileName, String body, Path folder, String extension) {
-
-    if (body == null) {
-      body = "";
-    }
-
-    try {
-      Files.write(folder.resolve(fileName + "-" + System.currentTimeMillis() + ".email." + extension), body.getBytes());
-    } catch (IOException e) {
-      throw new RuntimeException(e);
-    }
-  }
-
-
 }

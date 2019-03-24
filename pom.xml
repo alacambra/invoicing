@@ -71,12 +71,29 @@
         </dependency>
 
         <dependency>
-            <groupId>net.sf.cssbox</groupId>
-            <artifactId>pdf2dom</artifactId>
-            <version>1.7</version>
+            <groupId>org.w3c.tidy</groupId>
+            <artifactId>com.springsource.org.w3c.tidy</artifactId>
+            <version>0.0.0.04aug2000r7-dev</version>
         </dependency>
 
+        <dependency>
+            <groupId>org.xhtmlrenderer</groupId>
+            <artifactId>flying-saucer-pdf</artifactId>
+            <version>9.1.18</version>
+        </dependency>
+
+
     </dependencies>
+
+    <repositories>
+        <repository>
+            <id>s</id>
+            <releases/>
+            <snapshots/>
+            <url>http://jcenter.bintray.com/</url>
+        </repository>
+    </repositories>
+
     <build>
         <plugins>
             <plugin>
