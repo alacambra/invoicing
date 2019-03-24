@@ -1,6 +1,5 @@
 package tech.lacambra.invoicing;
 
-import com.itextpdf.tool.xml.exceptions.RuntimeWorkerException;
 import org.w3c.tidy.Tidy;
 import org.xhtmlrenderer.pdf.ITextRenderer;
 
@@ -422,8 +421,8 @@ public class AddressExtractor {
 
     String filterEmail = loadConfig().getString("filterEmail");
     try {
-      if (List.of(message.getAllRecipients()).toString().contains(filterEmail)) {
-        LOGGER.info("[isInvoiceEmail] found invoicing email " + filterEmail + ", from " + getFrom(message));
+      if (getRecipients(message).contains(filterEmail)) {
+        LOGGER.info("[isInvoiceEmail] found invoicing email for filtered email: " + filterEmail + ". All recipients: " + getRecipients(message) + ", from " + getFrom(message));
         return true;
       }
     } catch (MessagingException e) {
@@ -440,15 +439,24 @@ public class AddressExtractor {
   }
 
   private String getFrom(Message msg) throws MessagingException {
-    String from = "";
-    Address a[] = msg.getAllRecipients();
-    if (a == null) return null;
-    for (int i = 0; i < a.length; i++) {
-      Address address = a[i];
-      from = from + address.toString();
+    Address[] a = msg.getFrom();
+    return addressesToString(a);
+  }
+
+  private String getRecipients(Message msg) throws MessagingException {
+    Address[] a = msg.getAllRecipients();
+    return addressesToString(a);
+  }
+
+  private String addressesToString(Address[] addresses) throws MessagingException {
+    StringBuilder addr = new StringBuilder();
+    if (addresses == null) return null;
+    for (int i = 0; i < addresses.length; i++) {
+      Address address = addresses[i];
+      addr.append(address.toString());
     }
 
-    return from;
+    return addr.toString();
   }
 
   private void generatePDFFromHTML(String fileName, String body, Path folder, String encoding) {
@@ -489,7 +497,7 @@ public class AddressExtractor {
 
       Files.delete(Paths.get(tmpFileName));
 
-    } catch (RuntimeWorkerException | IOException | com.lowagie.text.DocumentException e) {
+    } catch (IOException | com.lowagie.text.DocumentException e) {
 
       if (Files.exists(filePath)) {
         try {
@@ -497,11 +505,6 @@ public class AddressExtractor {
         } catch (IOException e1) {
           throw new RuntimeException(e);
         }
-      }
-
-      if (e instanceof RuntimeWorkerException) {
-        LOGGER.log(Level.WARNING, "Error generating pedf for mail " + fileName + ": " + e.getMessage(), e);
-        return;
       }
 
       throw new RuntimeException(e);
