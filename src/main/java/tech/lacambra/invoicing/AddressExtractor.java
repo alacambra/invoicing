@@ -1,5 +1,11 @@
 package tech.lacambra.invoicing;
 
+import com.itextpdf.text.Document;
+import com.itextpdf.text.DocumentException;
+import com.itextpdf.text.pdf.PdfWriter;
+import com.itextpdf.tool.xml.XMLWorkerHelper;
+import com.itextpdf.tool.xml.exceptions.RuntimeWorkerException;
+
 import javax.json.*;
 import javax.json.stream.JsonCollectors;
 import javax.mail.*;
@@ -30,6 +36,8 @@ import java.util.stream.Stream;
 public class AddressExtractor {
 
   private static final Logger LOGGER = Logger.getLogger(AddressExtractor.class.getName());
+  private static final String TEXT_PLAIN = "text/plain";
+  private static final String TEXT_HTML = "text/html";
   private JsonObject config;
 
   public static void main(String[] args) throws IOException {
@@ -81,11 +89,12 @@ public class AddressExtractor {
     String username = props.getProperty("username");
     String password = props.getProperty("password");
     String protocol = props.getProperty("protocol");
+    int port = Integer.parseInt(props.getProperty("protocol"));
 
     try {
       //Connect to the server
       Session session = Session.getDefaultInstance(props, null);
-      Store store = session.getStore("imaps");
+      Store store = session.getStore(protocol);
       store.connect(host, 993, username, password);
       Stream.of(store.getPersonalNamespaces()).forEach(System.out::println);
 
@@ -120,9 +129,7 @@ public class AddressExtractor {
             try {
               LOGGER.info("[run] Begin processing of:" + message.getSubject());
 
-              address = getFrom(message);
-
-              Path folder = checkTargetOrCreate(message.getReceivedDate()).resolve(address);
+              Path folder = checkTargetOrCreate(message.getReceivedDate());
               if (!Files.exists(folder)) {
                 Files.createDirectory(folder);
               }
@@ -131,7 +138,7 @@ public class AddressExtractor {
               JsonArray fileNames = saveAttachmemnt(message, folder);
 
               LOGGER.info("[run] Saving message: " + message.getSubject());
-              saveMessage(message, folder, fileNames);
+              saveMessage(message, folder, fileNames, folder);
 
               LOGGER.info("[run] Message processed: " + message.getSubject());
 
@@ -161,9 +168,9 @@ public class AddressExtractor {
     return message.getSubject().replaceAll("[/\\ ]", "_").replace(" ", "_").toLowerCase();
   }
 
-  private void saveMessage(Message message, Path folder, JsonArray fileNames) {
+  private void saveMessage(Message message, Path folder, JsonArray fileNames, Path path) {
 
-    JsonObject msg = msgToJsonObject(message, fileNames);
+    JsonObject msg = msgToJsonObject(message, fileNames, path);
     String name = msg.getString("subject").replaceAll("[/\\ ]", "_").replace(" ", "_").toLowerCase();
     folder = folder.resolve(name + ".json");
     byte[] bytes = msg.toString().getBytes();
@@ -220,18 +227,27 @@ public class AddressExtractor {
     return builder.build();
   }
 
-  public JsonArray getContent(Message message) {
+  public JsonArray getContent(Message message, Path folder) {
     Multipart multipart;
     JsonArrayBuilder text = Json.createArrayBuilder();
     try {
 
       String type = message.getContentType().toLowerCase();
-      boolean isPlain = Stream.of("html", "text").anyMatch(type::contains);
+      boolean isHtml = Stream.of("html").anyMatch(type::contains);
+      boolean isPlain = Stream.of("text").anyMatch(type::contains);
 
       String body = "";
 
-      if (isPlain) {
+      if (isHtml) {
+
         body = (String) message.getContent();
+        generatePDFFromHTML(createMessageName(message), body, folder);
+
+      } else if (isPlain) {
+
+        body = (String) message.getContent();
+        saveEmailAsTextFile(createMessageName(message), body, folder, "txt");
+
       } else {
 
         multipart = (Multipart) message.getContent();
@@ -239,10 +255,21 @@ public class AddressExtractor {
           BodyPart bodyPart = multipart.getBodyPart(i);
           if (!Part.ATTACHMENT.equalsIgnoreCase(bodyPart.getDisposition())) {
             try (BufferedReader buff = new BufferedReader(new InputStreamReader(bodyPart.getInputStream()))) {
-              buff.lines().collect(Collectors.joining("\n"));
+              String bodyPartText = buff.lines().collect(Collectors.joining("\n"));
+              if (bodyPart.getContentType().contains(TEXT_HTML)) {
+                try {
+                  generatePDFFromHTML(createMessageName(message), bodyPartText, folder);
+                } catch (RuntimeWorkerException e) {
+                  saveEmailAsTextFile(createMessageName(message), bodyPartText, folder, "html");
+                }
+              } else if (bodyPart.getContentType().contains(TEXT_PLAIN)) {
+                saveEmailAsTextFile(createMessageName(message), bodyPartText, folder, "txt");
+              }
             }
           }
         }
+
+        saveEmailAsTextFile(createMessageName(message), body, folder, "txt");
       }
 
       if (!body.isEmpty()) {
@@ -278,7 +305,7 @@ public class AddressExtractor {
     return LocalDateTime.ofInstant(date.toInstant(), ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("MMMM_yyyy")).toUpperCase();
   }
 
-  private JsonObject msgToJsonObject(Message message, JsonArray fileNames) {
+  private JsonObject msgToJsonObject(Message message, JsonArray fileNames, Path path) {
 
     if (fileNames == null) {
       fileNames = JsonArray.EMPTY_JSON_ARRAY;
@@ -290,7 +317,7 @@ public class AddressExtractor {
           .add("to", Stream.of(message.getFrom()).map(this::addressToStr).map(Object::toString).collect(Collectors.joining(", ")))
           .add("subject", message.getSubject())
           .add("messageNumber", message.getMessageNumber())
-          .add("body", getContent(message))
+          .add("body", getContent(message, path))
           .add("received", message.getSentDate().toString())
           .add("files", fileNames)
           .build();
@@ -320,10 +347,8 @@ public class AddressExtractor {
   private boolean isInvoiceEmail(Message message) {
 
     String filterEmail = loadConfig().getString("filterEmail");
-    LOGGER.info("[isInvoiceEmail] Filtering email " + filterEmail);
-
-
     try {
+      LOGGER.info("[isInvoiceEmail] Filtering email " + filterEmail + ", from " + getFrom(message));
       return List.of(message.getAllRecipients()).toString().contains(filterEmail);
     } catch (MessagingException e) {
       throw new RuntimeException(e);
@@ -350,7 +375,6 @@ public class AddressExtractor {
   JsonObject addressToStr(Address address) {
     return Json.createObjectBuilder().add("type", address.getType()).add("txt", address.toString()).build();
   }
-
 
   private String getFrom(Message msg) throws MessagingException {
     String from = "";
@@ -381,5 +405,54 @@ public class AddressExtractor {
     }
     return new String(newStringBuffer);
   }
+
+  private void generatePDFFromHTML(String fileName, String body, Path folder) {
+
+    if (body == null) {
+      body = "";
+    }
+
+
+    Path filePath = folder.resolve(fileName + "-" + System.currentTimeMillis() + ".email.pdf");
+
+    try (InputStream bodyStream = new ByteArrayInputStream(body.getBytes())) {
+
+      Document document = new Document();
+      PdfWriter writer = PdfWriter.getInstance(document, new FileOutputStream(filePath.toString()));
+      document.open();
+      XMLWorkerHelper.getInstance().parseXHtml(writer, document, bodyStream);
+      document.close();
+
+    } catch (DocumentException | RuntimeWorkerException | IOException e) {
+
+      if (Files.exists(filePath)) {
+        try {
+          Files.delete(filePath);
+        } catch (IOException e1) {
+          throw new RuntimeException(e);
+        }
+      }
+
+      if (e instanceof RuntimeWorkerException) {
+        throw (RuntimeWorkerException) e;
+      }
+
+      throw new RuntimeException(e);
+    }
+  }
+
+  private void saveEmailAsTextFile(String fileName, String body, Path folder, String extension) {
+
+    if (body == null) {
+      body = "";
+    }
+
+    try {
+      Files.write(folder.resolve(fileName + "-" + System.currentTimeMillis() + ".email." + extension), body.getBytes());
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
 
 }
