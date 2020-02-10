@@ -14,6 +14,7 @@ import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneId;
@@ -168,17 +169,17 @@ public class AddressExtractor {
       String receivedOn = message.getReceivedDate().toString();
       String to = Stream.of(message.getFrom()).map(this::addressToStr).map(Object::toString).collect(Collectors.joining(", "));
 
-      int messageNumber = message.getMessageNumber();
-      JsonArray content = getContent(message, path);
+//      int messageNumber = message.getMessageNumber();
+      JsonArray content = getContentAndSave(message, path);
+//
+//      JsonObject jsonMsg = msgToJsonObject(from, to, subject, messageNumber, content, receivedOn, attachmentNames);
+//      String name = jsonMsg.getString("subject").replaceAll("[/\\ ]", "_").replace(" ", "_").toLowerCase();
+//      folder = folder.resolve(name + ".json");
+//
+//      byte[] bytes = jsonMsg.toString().getBytes();
+//      Files.write(folder, bytes);
 
-      JsonObject jsonMsg = msgToJsonObject(from, to, subject, messageNumber, content, receivedOn, attachmentNames);
-      String name = jsonMsg.getString("subject").replaceAll("[/\\ ]", "_").replace(" ", "_").toLowerCase();
-      folder = folder.resolve(name + ".json");
-
-      byte[] bytes = jsonMsg.toString().getBytes();
-      Files.write(folder, bytes);
-
-    } catch (MessagingException | IOException e) {
+    } catch (MessagingException e) {
       e.printStackTrace();
     }
   }
@@ -236,9 +237,14 @@ public class AddressExtractor {
 
     try (InputStream is = bodyPart.getInputStream()) {
 
-      String fName = messageName + "--" + bodyPart.getFileName().replace(".", "--" + System.currentTimeMillis() + ".");
+      String fName = messageName + "--" + bodyPart.getFileName();
       Path target = folder.resolve(fName);
-      Files.copy(is, target);
+
+      if (Files.exists(target)) {
+        Files.delete(target);
+      }
+
+      Files.copy(is, target, StandardCopyOption.REPLACE_EXISTING);
 
       return Optional.of(fName);
 
@@ -263,13 +269,13 @@ public class AddressExtractor {
     return message.getContentType().toLowerCase().contains("multipart");
   }
 
-  public JsonArray getContent(Message message, Path folder) {
+  public JsonArray getContentAndSave(Message message, Path folder) {
 
     try {
       String msgName = createMessageName(message);
       String type = message.getContentType().toLowerCase();
 
-      return getAndSaveContent(type, message.getContent(), msgName, folder, Json.createArrayBuilder()).build();
+      return getAndSaveContent(type, message.getContent(), message, msgName, folder, Json.createArrayBuilder()).build();
 
     } catch (IOException | MessagingException e) {
       throw new RuntimeException(e);
@@ -301,7 +307,7 @@ public class AddressExtractor {
     return type.contains(APPLICATION_PDF);
   }
 
-  public JsonArrayBuilder getAndSaveContent(String partType, Object content, String msgName, Path folder, JsonArrayBuilder builder) {
+  public JsonArrayBuilder getAndSaveContent(String partType, Object content, Message message, String msgName, Path folder, JsonArrayBuilder builder) {
 
     try {
 
@@ -316,13 +322,13 @@ public class AddressExtractor {
       if (isTextHtml(type)) {
 
         body = getContentString(content);
-        generatePDFFromHTML(msgName, body, folder, encoding);
-        saveEmailAsTextFile(msgName, body, folder, "html", encoding);
+//        generatePDFFromHTML(msgName, body, folder, encoding);
+        saveEmailAsTextFile(msgName, message, folder);
 
       } else if (isTextPlain(type)) {
 
         body = getContentString(content);
-        saveEmailAsTextFile(msgName, body, folder, "txt", encoding);
+        saveEmailAsTextFile(msgName, message, folder);
 
       } else if (isApplicationPdf(type) || (content instanceof BodyPart && partIsAttachment((BodyPart) content))) {
         savePart((BodyPart) content, msgName, folder);
@@ -333,7 +339,7 @@ public class AddressExtractor {
 
         for (int i = 0; i < multipart.getCount(); i++) {
           BodyPart bodyPart = multipart.getBodyPart(i);
-          builder = getAndSaveContent(bodyPart.getContentType(), bodyPart, msgName, folder, builder);
+          builder = getAndSaveContent(bodyPart.getContentType(), bodyPart, message, msgName, folder, builder);
         }
 
       } else {
@@ -511,15 +517,21 @@ public class AddressExtractor {
     }
   }
 
-  private void saveEmailAsTextFile(String fileName, String body, Path folder, String extension, String encoding) {
-
-    if (body == null) {
-      body = "";
-    }
+  private void saveEmailAsTextFile(String fileName, Message message, Path folder) {
 
     try {
-      Files.write(folder.resolve(fileName + "-" + System.currentTimeMillis() + ".email." + extension), body.getBytes(encoding));
-    } catch (IOException e) {
+
+      Path path = folder.resolve(fileName + ".eml");
+
+      if (Files.exists(path)) {
+        Files.delete(path);
+      }
+
+      FileOutputStream fileOutputStream = new FileOutputStream(path.toFile());
+
+      message.writeTo(fileOutputStream);
+
+    } catch (IOException | MessagingException e) {
       throw new RuntimeException(e);
     }
   }
